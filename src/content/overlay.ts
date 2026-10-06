@@ -6,17 +6,19 @@
  * - Click selects the element under the pointer; dragging selects a free area. Esc cancels.
  * - Then a comment box opens. Enter copies, Shift+Enter adds a line, Ctrl/Cmd+Enter starts a
  *   T3 Code thread in the chosen project (when the extension is paired with T3 Code).
- * - Before the screenshot the overlay is removed and two animation frames pass, so the capture
- *   shows the page only. The image is rendered here and written to the clipboard.
+ * - On start the page is paused: running animations and playing media stop, and the viewport is
+ *   captured and shown as a still under the overlay. Selection happens on that still, and the
+ *   annotation is cut from it, so hover menus and moving content stay as they were. Teardown
+ *   resumes the page. The image is rendered here and written to the clipboard.
  */
-import { annotationText, renderAnnotation, type Annotation } from "../lib/annotate.ts";
+import { annotationText, decodeDataUrl, renderAnnotation, type Annotation } from "../lib/annotate.ts";
 import { rectFromPoints, type Point, type Rect } from "../lib/geometry.ts";
 import type { CaptureResponse, ContentToWorker, T3ProjectsResponse, T3SendResponse, WorkerToContent } from "../lib/messages.ts";
 import { threadTitle } from "../lib/t3.ts";
 
 declare global {
   interface Window {
-    __screenshotAnnotator?: { start(): void };
+    __screenshotAnnotator?: { start(): Promise<void> };
   }
 }
 
@@ -26,7 +28,8 @@ const DRAG_THRESHOLD = 4;
 const MIN_AREA = 8;
 const TOAST_MS = 4000;
 
-type Selection = { kind: "element"; element: Element; description: string } | { kind: "area"; rect: Rect };
+/** Rects are taken when selecting: the still does not move, even if the page does. */
+type Selection = { kind: "element"; rect: Rect; description: string } | { kind: "area"; rect: Rect };
 
 function collapse(text: string | null | undefined): string {
   return (text ?? "").replace(/\s+/g, " ").trim();
@@ -56,10 +59,22 @@ function describeElement(el: Element): string {
   return desc;
 }
 
-function rectOf(sel: Selection): Rect {
-  if (sel.kind === "area") return sel.rect;
-  const r = sel.element.getBoundingClientRect();
+function rectOf(node: Element): Rect {
+  const r = node.getBoundingClientRect();
   return { x: r.left, y: r.top, width: r.width, height: r.height };
+}
+
+/** Pauses running animations (CSS and Web Animations) and playing media; returns the resume. */
+function pausePage(): () => void {
+  const animations = document.getAnimations().filter((a) => a.playState === "running");
+  const media = [...document.querySelectorAll<HTMLMediaElement>("audio, video")].filter((m) => !m.paused);
+  for (const a of animations) a.pause();
+  for (const m of media) m.pause();
+  return () => {
+    // Skip what the page cancelled or restarted meanwhile.
+    for (const a of animations) if (a.playState === "paused") a.play();
+    for (const m of media) if (m.paused) void m.play().catch(() => undefined);
+  };
 }
 
 function nextFrames(n: number): Promise<void> {
@@ -100,6 +115,7 @@ async function copyToClipboard(png: Promise<Blob>, text: string): Promise<void> 
 const STYLE = `
 :host { all: initial; }
 .layer { position: fixed; inset: 0; cursor: crosshair; font: 13px/1.4 system-ui, sans-serif; }
+.still { position: fixed; left: 0; top: 0; width: 100vw; height: 100vh; display: block; pointer-events: none; }
 .layer.commenting { cursor: default; }
 .box {
   position: fixed; pointer-events: none; display: none; box-sizing: border-box;
@@ -199,8 +215,12 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, className = "", text 
   return node;
 }
 
-function createOverlay(): { start(): void } {
+function createOverlay(): { start(): Promise<void> } {
   let phase: "select" | "comment" | null = null;
+  let starting = false;
+  /** Screenshot taken when the page was paused, and the viewport it shows. */
+  let still: { dataUrl: string; viewport: { width: number; height: number } } | null = null;
+  let resumePage: (() => void) | null = null;
   let host: HTMLElement | null = null;
   let parts: {
     layer: HTMLElement;
@@ -308,7 +328,7 @@ function createOverlay(): { start(): void } {
       return;
     }
     const target = underPointer(end);
-    if (target) openComment({ kind: "element", element: target, description: describeElement(target) });
+    if (target) openComment({ kind: "element", rect: rectOf(target), description: describeElement(target) });
   };
 
   const onKey = (e: KeyboardEvent) => {
@@ -335,16 +355,12 @@ function createOverlay(): { start(): void } {
     block(e);
   };
 
-  const onScroll = () => {
-    if (phase === "comment" && selection) {
-      showBox(rectOf(selection));
-      placePanel();
-    } else updateHover();
-  };
+  // The still does not scroll, and the page cannot be resized under it.
+  const onResize = () => teardown();
 
   const placePanel = () => {
     if (!parts || !selection) return;
-    const r = rectOf(selection);
+    const r = selection.rect;
     const w = 320;
     const h = parts.panel.offsetHeight || 130;
     const gap = 8;
@@ -364,7 +380,7 @@ function createOverlay(): { start(): void } {
     parts.tag.style.display = "none";
     parts.hint.classList.remove("bottom");
     parts.hint.textContent = "Add a comment · Enter copies · Shift+Enter new line · Esc cancels";
-    showBox(rectOf(sel));
+    showBox(sel.rect);
     placePanel();
     parts.textarea.focus();
     void loadT3();
@@ -408,7 +424,8 @@ function createOverlay(): { start(): void } {
     window[method]("pointerdown", onPointerDown as EventListener, opts);
     window[method]("pointermove", onPointerMove as EventListener, opts);
     window[method]("pointerup", onPointerUp as EventListener, opts);
-    window[method]("scroll", onScroll, opts);
+    window[method]("scroll", updateHover, opts);
+    window[method]("resize", onResize, opts);
     for (const t of BLOCKED) window[method](t, block, opts);
     for (const t of KEYS) window[method](t, onKey as EventListener, opts);
   };
@@ -422,6 +439,9 @@ function createOverlay(): { start(): void } {
     if (host) unmountHost(host);
     host = null;
     parts = null;
+    still = null;
+    resumePage?.();
+    resumePage = null;
   };
 
   const hideToast = () => {
@@ -452,31 +472,27 @@ function createOverlay(): { start(): void } {
     if (!sticky) toastTimer = window.setTimeout(hideToast, TOAST_MS);
   };
 
-  /** Reads the selection and comment, then removes the overlay. */
-  const takeAnnotation = (): Annotation | null => {
-    if (!parts || !selection) return null;
+  /** Reads the selection, comment and still, then removes the overlay and resumes the page. */
+  const takeAnnotation = (): { annotation: Annotation; still: string } | null => {
+    if (!parts || !selection || !still) return null;
+    const shot = still.dataUrl;
     const annotation: Annotation = {
       kind: selection.kind,
-      rect: rectOf(selection),
-      viewport: { width: window.innerWidth, height: window.innerHeight },
+      rect: selection.rect,
+      viewport: still.viewport,
       comment: parts.textarea.value.trim(),
       url: location.href,
       ...(selection.kind === "element" ? { element: selection.description } : {}),
     };
     teardown();
-    return annotation;
-  };
-
-  const screenshot = async (annotation: Annotation): Promise<Blob> => {
-    // Let the page repaint without the overlay before the worker takes the screenshot.
-    await nextFrames(2);
-    return renderAnnotation(await captureViewport(), annotation);
+    return { annotation, still: shot };
   };
 
   const copy = () => {
-    const annotation = takeAnnotation();
-    if (!annotation) return;
-    const png = screenshot(annotation);
+    const taken = takeAnnotation();
+    if (!taken) return;
+    const { annotation } = taken;
+    const png = renderAnnotation(taken.still, annotation);
     copyToClipboard(png, annotationText(annotation)).then(
       async () => showToast("Copied. Paste it into Claude Code or Codex.", await png),
       async (e: unknown) => {
@@ -492,12 +508,13 @@ function createOverlay(): { start(): void } {
     if (!parts || t3?.state !== "ok") return;
     const projectId = parts.project.value;
     const projectTitle = parts.project.selectedOptions[0]?.textContent ?? "T3 Code";
-    const annotation = takeAnnotation();
-    if (!annotation || !projectId) return;
+    const taken = takeAnnotation();
+    if (!taken || !projectId) return;
+    const { annotation } = taken;
     void (async () => {
       let png: Blob | undefined;
       try {
-        png = await screenshot(annotation);
+        png = await renderAnnotation(taken.still, annotation);
         showToast(`Sending to ${projectTitle}…`, undefined, true);
         const res = await toWorker<T3SendResponse>({
           type: "t3/send",
@@ -518,10 +535,33 @@ function createOverlay(): { start(): void } {
     })();
   };
 
+  /** Pauses the page and captures it once nothing of ours is on screen. */
+  const freeze = async (): Promise<ImageBitmap> => {
+    resumePage = pausePage();
+    // Let the page repaint without the overlay or toast before the worker takes the screenshot.
+    await nextFrames(2);
+    const viewport = { width: window.innerWidth, height: window.innerHeight };
+    const dataUrl = await captureViewport();
+    still = { dataUrl, viewport };
+    return decodeDataUrl(dataUrl);
+  };
+
   return {
-    start() {
+    async start() {
+      if (starting) return;
+      starting = true;
       if (phase) teardown();
       hideToast();
+      let bitmap: ImageBitmap;
+      try {
+        bitmap = await freeze();
+      } catch (e) {
+        teardown();
+        showToast(e instanceof Error ? e.message : String(e), undefined, true);
+        return;
+      } finally {
+        starting = false;
+      }
       const mounted = mountHost([
         "inset: 0",
         "width: 100vw",
@@ -533,7 +573,12 @@ function createOverlay(): { start(): void } {
       ]);
       host = mounted.host;
       const layer = el("div", "layer");
-      const hint = el("div", "hint", "Click an element or drag an area · Esc cancels");
+      const canvas = el("canvas", "still");
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      canvas.getContext("2d")?.drawImage(bitmap, 0, 0);
+      bitmap.close();
+      const hint = el("div", "hint", "Page paused · Click an element or drag an area · Esc cancels");
       hint.setAttribute("role", "status");
       const panel = el("div", "panel");
       const textarea = el("textarea");
@@ -559,7 +604,7 @@ function createOverlay(): { start(): void } {
       panel.append(textarea, actions, t3Row, t3Status);
       const box = el("div", "box");
       const tag = el("div", "tag");
-      layer.append(box, tag, hint, panel);
+      layer.append(canvas, box, tag, hint, panel);
       mounted.root.append(layer);
       parts = { layer, box, tag, hint, panel, textarea, root: mounted.root, project, send, t3Status };
       phase = "select";
@@ -573,7 +618,7 @@ if (!window.__screenshotAnnotator) {
   window.__screenshotAnnotator = overlay;
   chrome.runtime.onMessage.addListener((raw: unknown, _sender, sendResponse) => {
     if ((raw as WorkerToContent)?.type !== "overlay/start") return false;
-    overlay.start();
+    void overlay.start();
     sendResponse({ ok: true });
     return false;
   });

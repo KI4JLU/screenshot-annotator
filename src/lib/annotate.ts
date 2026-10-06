@@ -30,7 +30,7 @@ export function annotationText(a: Annotation): string {
   return a.comment ? `${a.comment}\n\n${meta}` : meta;
 }
 
-async function decodeDataUrl(dataUrl: string): Promise<ImageBitmap> {
+export async function decodeDataUrl(dataUrl: string): Promise<ImageBitmap> {
   // Decoded by hand: fetch(data:…) can be blocked by the page's Content Security Policy.
   const binary = atob(dataUrl.slice(dataUrl.indexOf(",") + 1));
   const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));

@@ -2,7 +2,7 @@
 
 A Chrome extension that captures a screenshot with your comment on it, for pasting into Claude Code or Codex, or for starting a [T3 Code](https://github.com/pingdotgg/t3code) thread directly.
 
-1. Click the toolbar icon or press <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd>.
+1. Click the toolbar icon or press <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd>. The page pauses: animations and videos stop, and you mark on a still of the page, so open menus and tooltips stay put. It resumes when you finish or cancel.
 2. Click an element, or drag to select an area. <kbd>Esc</kbd> cancels.
 3. Type a comment and press <kbd>Enter</kbd> (<kbd>Shift</kbd>+<kbd>Enter</kbd> adds a line).
 4. Paste into Claude Code or Codex with <kbd>Ctrl</kbd>+<kbd>V</kbd>.
@@ -43,6 +43,7 @@ This uses T3 Code's internal HTTP API (tested with 0.0.45-nightly) and may break
 ## Limits
 
 - Only the visible part of the page is captured. Scroll the element into view first.
+- Pausing stops CSS and Web animations and `<audio>`/`<video>`, not the page's scripts, so content changed by JavaScript (a ticker, a live feed) keeps changing underneath. The still does not show this, but an element you click is outlined where it is right then. Resizing the window cancels the selection.
 - The browser only allows clipboard access on HTTPS and `localhost`. On other plain-HTTP pages the extension shows the image instead: right-click it and choose "Copy image".
 - Chrome pages (`chrome://…`, the Web Store) cannot be marked. The icon shows a red `!` in that case.
 
